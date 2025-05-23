@@ -2,12 +2,12 @@ import os
 import asyncio
 import httpx
 import tempfile
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 from qdrant_client import QdrantClient, models
 from dotenv import load_dotenv
 import uvicorn
-from typing import List, Optional
+from typing import List, Optional, Union
 import logging
 from datetime import datetime
 import traceback
@@ -26,34 +26,36 @@ app = FastAPI()
 qdrant = QdrantClient(
     url=os.getenv("QDRANT_URL"),
     api_key=os.getenv("QDRANT_API_KEY"),
-    timeout=30  # Increased timeout
+    timeout=30
 )
 
-# Placeholder for DocumentProcessor (assuming docling supports Excel)
+# Placeholder for DocumentProcessor
 from docling.document_converter import DocumentConverter
+from docling.chunking import HybridChunker
 
 class DocumentProcessor:
     async def process(self, content: bytes, filename: str):
         tmp_path = None
         try:
-            # Validate file extension
             valid_extensions = {'.pdf', '.docx', '.txt', '.xlsx', '.xls'}
             if not any(filename.lower().endswith(ext) for ext in valid_extensions):
                 raise ValueError(f"Unsupported file format for {filename}")
 
-            # Save the uploaded content to a temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{filename.split('.')[-1]}") as tmp:
                 tmp.write(content)
                 tmp_path = tmp.name
 
-            # Use Docling to convert the document
             converter = DocumentConverter()
-            result = converter.convert(tmp_path, max_file_size= 1024 * 512) 
+            result = converter.convert(tmp_path, max_file_size=1024 * 512)
 
-            # Export to markdown
             markdown = result.document.export_to_markdown()
-            logger.info(f"Processed {filename} to markdown")
-            return type("Doc", (), {"text": markdown})()
+            doc = result.document
+            chunker = HybridChunker(tokenizer="BAAI/bge-small-en-v1.5")
+            chunk_iter = chunker.chunk(doc)
+            chunks = [chunk.text.strip() for chunk in chunk_iter if hasattr(chunk, "text") and chunk.text and chunk.text.strip()]
+
+            logger.info(f"Extracted {len(chunks)} chunks from {filename}")
+            return type("Doc", (), {"text": chunks})()
         except ValueError as ve:
             logger.error(f"Validation error: {str(ve)}\n{traceback.format_exc()}")
             raise HTTPException(status_code=400, detail=str(ve))
@@ -61,7 +63,6 @@ class DocumentProcessor:
             logger.error(f"Processing error: {str(e)}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Docling processing failed: {str(e)}")
         finally:
-            # Ensure temp file is removed
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
@@ -70,7 +71,6 @@ class DocumentProcessor:
 
 processor = DocumentProcessor()
 
-# Cohere API configuration
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 if not COHERE_API_KEY:
     raise ValueError("COHERE_API_KEY environment variable is required")
@@ -81,11 +81,9 @@ cohere_headers = {
     "Cohere-Version": "2022-12-06"
 }
 
-# Global variable to store processed documents
 documents = []
 
 async def process_document(file: UploadFile) -> Optional[dict]:
-    """Process a single uploaded file using DocumentProcessor"""
     try:
         content = await file.read()
         doc = await processor.process(content, file.filename)
@@ -100,12 +98,34 @@ async def process_document(file: UploadFile) -> Optional[dict]:
     finally:
         await file.close()
 
-async def get_embeddings(texts: List[str], batch_size: int = 5) -> List[List[float]]:  # Reduced batch size
-    """Get embeddings from Cohere API"""
+MAX_CHAR_LIMIT = 2000
+
+def flatten_texts(texts: List[Union[str, List[str]]]) -> List[str]:
+    flat = []
+    for text in texts:
+        if isinstance(text, list):
+            flat.extend(text)
+        elif isinstance(text, str):
+            flat.append(text)
+    return flat
+
+def sanitize_texts(texts: List[Union[str, List[str]]]) -> List[str]:
+    flat_texts = flatten_texts(texts)
+    return [
+        text.strip()
+        for text in flat_texts
+        if isinstance(text, str) and text.strip() and len(text.strip()) <= MAX_CHAR_LIMIT
+    ]
+
+async def get_embeddings(texts: List[str], batch_size: int = 5) -> List[List[float]]:
+    sanitized_texts = sanitize_texts(texts)
+    if not sanitized_texts:
+        raise HTTPException(status_code=400, detail="No valid chunks to embed")
+
     embeddings = []
-    async with httpx.AsyncClient(timeout=30.0) as client:  # Increased timeout
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i in range(0, len(sanitized_texts), batch_size):
+            batch = sanitized_texts[i:i + batch_size]
             try:
                 response = await client.post(
                     "https://api.cohere.ai/v1/embed",
@@ -117,17 +137,16 @@ async def get_embeddings(texts: List[str], batch_size: int = 5) -> List[List[flo
                     }
                 )
                 response.raise_for_status()
-                embeddings.extend(response.json()["embeddings"])
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Cohere API error: {str(e)}\n{traceback.format_exc()}")
-                raise HTTPException(status_code=500, detail=f"Cohere API error: {str(e)}")
+                batch_embeddings = response.json().get("embeddings")
+                if not batch_embeddings:
+                    raise ValueError("Empty embedding response")
+                embeddings.extend(batch_embeddings)
             except Exception as e:
-                logger.error(f"Unexpected error during embedding: {str(e)}\n{traceback.format_exc()}")
-                raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+                logger.error(f"Embedding error: {str(e)}\n{traceback.format_exc()}")
+                raise HTTPException(status_code=500, detail=str(e))
     return embeddings
 
 async def index_documents(new_documents: List[dict]):
-    """Index documents in Qdrant"""
     global documents
     collection_name = "rag_collection"
     vector_size = 1024
@@ -135,19 +154,16 @@ async def index_documents(new_documents: List[dict]):
     try:
         try:
             qdrant.get_collection(collection_name)
-        except Exception as e:
+        except Exception:
             logger.info(f"Creating new collection: {collection_name}")
             qdrant.create_collection(
                 collection_name=collection_name,
-                vectors_config=models.VectorParams(
-                    size=vector_size,
-                    distance=models.Distance.COSINE
-                )
+                vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
             )
-        
+
         texts = [doc["text"] for doc in new_documents]
         embeddings = await get_embeddings(texts)
-        
+
         points = [
             models.PointStruct(
                 id=doc["id"],
@@ -157,17 +173,15 @@ async def index_documents(new_documents: List[dict]):
                     "source": doc["filename"],
                     "indexed_at": datetime.now().isoformat()
                 }
-            )
-            for i, doc in enumerate(new_documents)
+            ) for i, doc in enumerate(new_documents)
         ]
-        
-        operation_info = qdrant.upsert(
+
+        qdrant.upsert(
             collection_name=collection_name,
             points=points,
-            wait=True  # Wait for operation to complete
+            wait=True
         )
-        logger.info(f"Upsert operation info: {operation_info}")
-        
+
         documents.extend(new_documents)
         logger.info(f"Successfully indexed {len(new_documents)} documents")
     except Exception as e:
@@ -175,7 +189,6 @@ async def index_documents(new_documents: List[dict]):
         raise HTTPException(status_code=500, detail=f"Indexing failed: {str(e)}")
 
 async def retrieve_documents(query: str, limit: int = 3) -> List[str]:
-    """Retrieve relevant documents from Qdrant"""
     try:
         query_embedding = (await get_embeddings([query]))[0]
         results = qdrant.search(
@@ -186,24 +199,26 @@ async def retrieve_documents(query: str, limit: int = 3) -> List[str]:
         )
         return [hit.payload["text"] for hit in results]
     except Exception as e:
-        logger.error(f"Error retrieving documents: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"Retrieval error: {str(e)}\n{traceback.format_exc()}")
         return []
 
 async def generate_response(query: str, context: List[str]) -> str:
-    """Generate response using Cohere's generate API"""
-    if not context:
+    flat_context = flatten_texts(context)
+    combined_context = "\n\n".join(flat_context)
+
+    if not combined_context:
         return "No relevant documents found to answer the query."
-    
+
     prompt = f"""You are a helpful assistant. The context below is in markdown format. Use it to provide a concise and accurate answer to the query, ignoring markdown syntax like headings or lists unless relevant to the content.
 
 Context:
-{"\n\n".join(context)}
+{combined_context}
 
 Query: {query}
 
 Answer:"""
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:  # Increased timeout
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.post(
                 "https://api.cohere.ai/v1/generate",
@@ -220,108 +235,42 @@ Answer:"""
             )
             response.raise_for_status()
             return response.json()["generations"][0]["text"].strip()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Cohere generate error: {str(e)}\n{traceback.format_exc()}")
-            return "Failed to generate response due to API error."
         except Exception as e:
-            logger.error(f"Unexpected generate error: {str(e)}\n{traceback.format_exc()}")
-            return "Failed to generate response due to unexpected error."
+            logger.error(f"Generation error: {str(e)}\n{traceback.format_exc()}")
+            return "Failed to generate response."
 
 @app.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
-    """Handle file uploads and index them in Qdrant"""
     try:
         if not files:
             raise HTTPException(status_code=400, detail="No files uploaded")
-        
+
         tasks = [process_document(file) for file in files]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Handle exceptions in results
-        new_documents = []
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Document processing error: {str(result)}")
-            elif result is not None:
-                new_documents.append(result)
-        
-        if not new_documents:
+        processed_docs = await asyncio.gather(*tasks)
+        new_docs = [doc for doc in processed_docs if doc]
+
+        if not new_docs:
             raise HTTPException(status_code=400, detail="No valid documents processed")
-        
-        await index_documents(new_documents)
-        
-        return JSONResponse({
-            "message": f"Successfully processed and indexed {len(new_documents)} documents",
-            "filenames": [doc["filename"] for doc in new_documents]
-        })
+
+        await index_documents(new_docs)
+        return {"message": f"Successfully uploaded and indexed {len(new_docs)} documents."}
     except Exception as e:
-        logger.error(f"Error processing files: {str(e)}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error processing files: {str(e)}")
+        logger.error(f"Upload error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Upload and indexing failed.")
 
 @app.post("/query")
-async def handle_query(request: Request):
-    """Handle user queries"""
+async def query_documents(request: dict):
     try:
-        data = await request.json()
-        query = data.get("query", "").strip()
-        
+        query = request.get("query")
         if not query:
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-        context = await retrieve_documents(query)
-        response = await generate_response(query, context)
-        
-        if not response or "failed" in response.lower():
-            raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please try again.")
-            
-        return JSONResponse({
-            "query": query,
-            "response": response,
-            "context": context
-        })
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-    except Exception as e:
-        logger.error(f"Error processing query: {str(e)}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+            raise HTTPException(status_code=400, detail="Query text is required")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    try:
-        # Check Qdrant connection
-        qdrant.get_collections()
-        
-        # Check Cohere connection
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                "https://api.cohere.ai/v1/tokenize",
-                headers=cohere_headers,
-                params={"text": "test"}
-            )
-            response.raise_for_status()
-            
-        return {"status": "healthy", "qdrant": "connected", "cohere": "connected"}
+        retrieved = await retrieve_documents(query)
+        answer = await generate_response(query, retrieved)
+        return {"query": query, "answer": answer, "sources": retrieved}
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {"status": "unhealthy", "error": str(e)}
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application on startup"""
-    try:
-        required_vars = ["QDRANT_URL", "QDRANT_API_KEY", "COHERE_API_KEY"]
-        missing = [var for var in required_vars if not os.getenv(var)]
-        if missing:
-            raise ValueError(f"Missing environment variables: {', '.join(missing)}")
-        
-        # Test connections
-        await health_check()
-        
-        logger.info("Application initialization complete")
-    except Exception as e:
-        logger.error(f"Startup error: {str(e)}\n{traceback.format_exc()}")
-        raise
+        logger.error(f"Query handling failed: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Query processing failed")
 
 if __name__ == "__main__":
     uvicorn.run(
